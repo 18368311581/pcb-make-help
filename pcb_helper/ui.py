@@ -31,6 +31,7 @@ from vtkmodules.vtkRenderingCore import vtkWindowToImageFilter
 from vtkmodules.vtkIOImage import vtkPNGWriter
 
 from .model import load_boards, fingerprint, suggest_tray_label
+from .inventory import inventory_rows, save_inventory_png
 from .geometry import Parameters, board_polygon, pocket_layout, pocket_polygon, label_position, label_size, label_outline, gap_polygons, build, export_pair
 
 APP_DIR=Path(__file__).resolve().parent
@@ -426,6 +427,7 @@ class MainWindow(QMainWindow):
         super().__init__(); self.setWindowTitle('PCB 贴装助手'); self.resize(1450,940)
         DATA_DIR.mkdir(exist_ok=True)
         self.boards=[]; self.source=None; self.source_hash=''; self.solid=None; self.warnings=[]
+        self.inventory_rows=[]
         self.worker=None; self.loading=False; self.side_state={'fixture':'top','tray':'top'}; self.current_tool='fixture'
         self.current_config_path=None; self.saved_parameters=None; self.config_dirty=False
         self.list_collapsed=False
@@ -439,12 +441,16 @@ class MainWindow(QMainWindow):
         self.help_button=QPushButton('使用帮助'); bar.addWidget(self.help_button); layout.addLayout(bar)
         self.split=QSplitter(); layout.addWidget(self.split,1)
         left=QWidget(); left_layout=QVBoxLayout(left); left.setMinimumWidth(310); left.setMaximumWidth(420)
-        self.tool=QComboBox(); self.tool.addItem('锡膏印刷定位夹具','fixture'); self.tool.addItem('元件备料盘','tray'); left_layout.addWidget(self.tool)
-        sidebar=QHBoxLayout(); self.top=QRadioButton('顶面'); self.bottom=QRadioButton('底面'); self.top.setChecked(True)
-        group=QButtonGroup(self); group.addButton(self.top); group.addButton(self.bottom); sidebar.addWidget(self.top); sidebar.addWidget(self.bottom); left_layout.addLayout(sidebar)
+        self.tool=QComboBox(); self.tool.addItem('锡膏印刷定位夹具','fixture'); self.tool.addItem('元件备料盘','tray'); self.tool.addItem('找料与焊接清单','inventory'); left_layout.addWidget(self.tool)
+        self.inventory_note=QLabel('按种类、规格值、封装与立创 C 编号整理所选 PCB 的顶底两面元件。\n\n切换到备料盘可修改元件安装类型；返回清单后会重新统计。')
+        self.inventory_note.setWordWrap(True); left_layout.addWidget(self.inventory_note)
+        self.inventory_spacer=QWidget(); left_layout.addWidget(self.inventory_spacer,1)
+        self.side_panel=QWidget(); sidebar=QHBoxLayout(self.side_panel); sidebar.setContentsMargins(0,0,0,0)
+        self.top=QRadioButton('顶面'); self.bottom=QRadioButton('底面'); self.top.setChecked(True)
+        group=QButtonGroup(self); group.addButton(self.top); group.addButton(self.bottom); sidebar.addWidget(self.top); sidebar.addWidget(self.bottom); left_layout.addWidget(self.side_panel)
         self.side_hint=QLabel('导入后判断板面可用性'); self.side_hint.setWordWrap(True); left_layout.addWidget(self.side_hint)
-        scroll=QScrollArea(); scroll.setWidgetResizable(True); panel=QWidget(); self.form=QFormLayout(panel); scroll.setWidget(panel); left_layout.addWidget(scroll,1)
-        print_panel=QWidget(); self.print_form=QFormLayout(print_panel); left_layout.addWidget(print_panel)
+        self.parameter_scroll=QScrollArea(); self.parameter_scroll.setWidgetResizable(True); panel=QWidget(); self.form=QFormLayout(panel); self.parameter_scroll.setWidget(panel); left_layout.addWidget(self.parameter_scroll,1)
+        self.print_panel=QWidget(); self.print_form=QFormLayout(self.print_panel); left_layout.addWidget(self.print_panel)
         self.controls={}; defaults=Parameters()
         for key,label in LABELS.items():
             spin=QDoubleSpinBox(); spin.setRange(0,10000); spin.setDecimals(3); spin.setSingleStep(.1); spin.setValue(getattr(defaults,key)); spin.setSuffix(' 倍' if key=='spacing' else ' mm')
@@ -461,10 +467,11 @@ class MainWindow(QMainWindow):
         add=QPushButton('添加缺口'); remove=QPushButton('移除选中'); gb.addWidget(add); gb.addWidget(remove); self.form.addRow(gap_bar); self.gap_bar=gap_bar
         add.clicked.connect(lambda:self.add_gap(0,20)); remove.clicked.connect(self.remove_gap); self.gaps.cellChanged.connect(self.parameter_changed)
         self.set_gaps(defaults.gaps)
-        reset=QPushButton('恢复默认'); reset.clicked.connect(self.reset_parameters); left_layout.addWidget(reset)
+        self.reset_button=QPushButton('恢复默认'); self.reset_button.clicked.connect(self.reset_parameters); left_layout.addWidget(self.reset_button)
         self.config_label=QLabel('配置：未命名'); left_layout.addWidget(self.config_label)
-        configs=QHBoxLayout(); save=QPushButton('保存'); save_as=QPushButton('另存为'); restore=QPushButton('打开配置')
-        configs.addWidget(save); configs.addWidget(save_as); configs.addWidget(restore); left_layout.addLayout(configs)
+        self.config_panel=QWidget(); configs=QHBoxLayout(self.config_panel); configs.setContentsMargins(0,0,0,0)
+        save=QPushButton('保存'); save_as=QPushButton('另存为'); restore=QPushButton('打开配置')
+        configs.addWidget(save); configs.addWidget(save_as); configs.addWidget(restore); left_layout.addWidget(self.config_panel)
         save.clicked.connect(self.save_dialog); save_as.clicked.connect(self.save_as_dialog); restore.clicked.connect(self.restore_dialog)
         self.generate=QPushButton('生成实体并预览'); self.generate.setObjectName('primaryAction'); self.generate.setMinimumHeight(40); left_layout.addWidget(self.generate)
         self.export=QPushButton('导出 STL + STP'); self.export.setEnabled(False); left_layout.addWidget(self.export)
@@ -515,7 +522,23 @@ class MainWindow(QMainWindow):
         self.right_split.setStretchFactor(0,3); self.right_split.setStretchFactor(1,2)
         self.right_split.setSizes([520,330])
         self.right_split.handle(1).setToolTip('拖动以调整元件列表高度')
-        rl.addWidget(self.right_split,1); self.split.addWidget(right); self.split.setSizes([340,1060])
+        rl.addWidget(self.right_split,1)
+        self.inventory_pane=QWidget(); inventory_layout=QVBoxLayout(self.inventory_pane)
+        inventory_layout.setContentsMargins(0,0,0,0)
+        self.inventory_heading=QLabel('找料与焊接清单'); self.inventory_heading.setObjectName('inventoryHeading')
+        inventory_layout.addWidget(self.inventory_heading)
+        self.inventory_table=QTableWidget(0,8)
+        self.inventory_table.setHorizontalHeaderLabels(['种类','规格值','封装','立创 C 编号','板面','安装','数量','位号'])
+        self.inventory_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.inventory_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.inventory_table.setAlternatingRowColors(True)
+        self.inventory_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.inventory_table.horizontalHeader().setSectionResizeMode(7,QHeaderView.ResizeMode.Stretch)
+        for column,width in enumerate((95,150,165,145,70,80,65)):
+            self.inventory_table.setColumnWidth(column,width)
+        inventory_layout.addWidget(self.inventory_table,1)
+        self.inventory_pane.hide(); rl.addWidget(self.inventory_pane,1)
+        self.split.addWidget(right); self.split.setSizes([340,1060])
         self.status=QLabel('请导入 EasyEDA 专业版 .eprj2。默认尺寸为试验起点，打印后需试配。'); self.status.setWordWrap(True); self.status.setMinimumHeight(42); layout.addWidget(self.status)
         self.open_button.clicked.connect(self.open_dialog); self.help_button.clicked.connect(self.show_help)
         self.board_box.currentIndexChanged.connect(self.board_changed); self.tool.currentIndexChanged.connect(self.tool_changed)
@@ -539,8 +562,9 @@ class MainWindow(QMainWindow):
         browser.setHtml('''
             <h2>PCB 贴装助手</h2>
             <p style="white-space: pre-wrap;">V1.0   MadeBy ChatGPT&江沛宸   In 20260925</p>
-            <p>本地读取 EasyEDA 专业版 <code>.eprj2</code> 工程，生成锡膏印刷定位夹具或元件备料盘。
-            两种工具均可导出 STL 与实体 STEP；KiCad 和 Altium 导入暂未支持。</p>
+            <p>本地读取 EasyEDA 专业版 <code>.eprj2</code> 工程，生成锡膏印刷定位夹具、元件备料盘，
+            或整理找料与焊接清单。两种打印工具可导出 STL 与实体 STEP；清单可导出完整表格 PNG。
+            KiCad 和 Altium 导入暂未支持。</p>
             <h3>开始使用</h3>
             <ol>
               <li>点击“导入工程”，选定工程；如果工程包含多块 PCB，再从顶部列表选定一块。</li>
@@ -549,6 +573,9 @@ class MainWindow(QMainWindow):
                   备料标注可自动生成，也可逐项编辑、清空或拖动。</li>
               <li>检查二维布局和底部提示，然后点击“生成实体并预览”。修改尺寸或元件后，需要重新生成。</li>
               <li>点击“导出 STL + STP”并选择目录。程序会建立独立文件夹，包含模型、报告和元件清单。</li>
+              <li>找料与焊接清单统计所选 PCB 两面的待安装元件，按大类、规格值、封装和立创 C 编号归并，
+                  列出数量与位号。工程标记不装配或手动忽略的元件不计入；安装类型待确认的元件仍会标出。
+                  点击“导出清单 PNG”保存完整表格图片。</li>
             </ol>
             <h3>视图与配置</h3>
             <p>二维视图：滚轮以鼠标位置缩放，右键拖动平移；备料盘可切换为左键移动凹槽或标注。
@@ -759,12 +786,21 @@ class MainWindow(QMainWindow):
         self.toggle_list.setText('展开元件列表' if self.list_collapsed else '收起元件列表')
     def tool_changed(self):
         tool=self.tool.currentData(); self.current_tool=tool
-        self.loading=True; self.top.setChecked(self.side_state[tool]=='top'); self.bottom.setChecked(self.side_state[tool]=='bottom'); self.loading=False
+        if tool in self.side_state:
+            self.loading=True; self.top.setChecked(self.side_state[tool]=='top'); self.bottom.setChecked(self.side_state[tool]=='bottom'); self.loading=False
+        inventory=tool=='inventory'
+        for widget in (self.side_panel,self.side_hint,self.parameter_scroll,self.print_panel,
+                       self.reset_button,self.config_label,self.config_panel):
+            widget.setVisible(not inventory)
+        self.inventory_note.setVisible(inventory); self.inventory_spacer.setVisible(inventory)
+        self.right_split.setVisible(not inventory); self.inventory_pane.setVisible(inventory)
+        self.generate.setText('重新整理清单' if inventory else '生成实体并预览')
+        self.export.setText('导出清单 PNG' if inventory else '导出 STL + STP')
         fixture={'base','wall','margin','pcb_thickness','stencil_thickness','pcb_gap','stencil_gap','wall_height'}
         shared={'print_width','print_height'}
         for key,control in self.controls.items():
             if key in shared: continue
-            show=(key in fixture)==(tool=='fixture')
+            show=tool!='inventory' and ((key in fixture)==(tool=='fixture'))
             self.form.setRowVisible(control,show)
         for w in (self.gaps,self.gap_label,self.gap_bar): self.form.setRowVisible(w,tool=='fixture')
         self.edit_bar.setVisible(tool=='tray')
@@ -801,10 +837,42 @@ class MainWindow(QMainWindow):
             try: self.config_dirty=self.config_values()!=self.saved_parameters
             except (ValueError,TypeError): self.config_dirty=True
             self.update_config_title()
+    def populate_inventory(self,board):
+        rows=inventory_rows(board); self.inventory_rows=rows
+        table=self.inventory_table
+        table.setSortingEnabled(False); table.setRowCount(len(rows))
+        previous=None
+        for index,row in enumerate(rows):
+            values=(row.category,row.value,row.footprint,row.supplier_part or '未填写',
+                    row.sides,row.mounting,str(row.quantity),'、'.join(row.refs))
+            for column,value in enumerate(values):
+                item=SortableItem(value)
+                item.setToolTip(value)
+                if column==6: item.setData(Qt.ItemDataRole.UserRole,row.quantity)
+                if row.category!=previous:
+                    item.setBackground(QColor('#e2f0f3'))
+                    font=item.font(); font.setBold(True); item.setFont(font)
+                table.setItem(index,column,item)
+            previous=row.category
+        count=sum(row.quantity for row in rows)
+        missing=sum(row.quantity for row in rows if not row.supplier_part)
+        unknown=sum(row.quantity for row in rows if row.mounting=='待确认')
+        self.inventory_heading.setText(f'{board.title} · {count} 个元件 / {len(rows)} 种料件')
+        notes=[]
+        if missing: notes.append(f'{missing} 个元件缺少立创 C 编号')
+        if unknown: notes.append(f'{unknown} 个元件安装类型待确认')
+        self.status.setText('找料清单已整理；包含顶面与底面的贴装、插装元件。'
+                            +(' '+ '；'.join(notes) if notes else ''))
+        self.generate.setEnabled(True); self.export.setEnabled(True)
     def refresh(self):
         board=self.board(); self.flat.clear_layout()
         if not board:
-            self.status.setText('请选择 PCB。'); self.generate.setEnabled(False); return
+            self.inventory_rows=[]; self.inventory_table.setRowCount(0)
+            self.inventory_heading.setText('找料与焊接清单')
+            self.status.setText('请选择 PCB。'); self.generate.setEnabled(False); self.export.setEnabled(False); return
+        if self.current_tool=='inventory':
+            self.populate_inventory(board)
+            return
         summary=[]; available={}
         self.loading=True
         for side,radio,label in [('top',self.top,'顶面'),('bottom',self.bottom,'底面')]:
@@ -857,6 +925,8 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.generate.setEnabled(False); self.status.setText(str(exc))
     def generate_model(self):
+        if self.current_tool=='inventory':
+            self.refresh(); return
         try: p=self.params(); board=self.board(); side=self.side(); tool=self.current_tool
         except Exception as exc: self.error(str(exc)); return
         def work(progress):
@@ -879,6 +949,18 @@ class MainWindow(QMainWindow):
             self.status.setText('实体已生成并通过有效性检查。'+(' '+ '；'.join(self.warnings[:3]) if self.warnings else ''))
         self.run_job(work,done,'生成实体并预览')
     def export_model(self):
+        if self.current_tool=='inventory':
+            board=self.board()
+            if not board: return
+            suggested=DATA_DIR/(board.title+'_找料清单.png')
+            path,_=QFileDialog.getSaveFileName(self,'导出找料清单图片',str(suggested),'PNG 图片 (*.png)')
+            if not path: return
+            if not Path(path).suffix: path+='.png'
+            try:
+                save_inventory_png(path,board.title,self.inventory_rows)
+                self.status.setText('清单图片已保存：'+str(path))
+            except Exception as exc: self.error(str(exc))
+            return
         if self.solid is None: return
         directory=QFileDialog.getExistingDirectory(self,'选择导出目录',str(DATA_DIR))
         if not directory: return
